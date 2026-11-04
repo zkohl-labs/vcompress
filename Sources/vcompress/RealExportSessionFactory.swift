@@ -62,6 +62,18 @@ struct RealExportSessionFactory: ExportSessionFactory {
         let reader = try AVAssetReader(asset: asset)
         let writer = try AVAssetWriter(outputURL: destination, fileType: fileType)
 
+        // Each reader output paired with the writer input it feeds. A track that
+        // cannot be added fails the encode instead of being skipped.
+        var pairs: [(output: AVAssetReaderTrackOutput, input: AVAssetWriterInput)] = []
+        func addPair(_ output: AVAssetReaderTrackOutput, _ input: AVAssetWriterInput, _ name: String) throws {
+            guard reader.canAdd(output), writer.canAdd(input) else {
+                throw EncodingError.exportFailed(TrackError(message: "cannot write the \(name) track to \(fileType.rawValue)"))
+            }
+            reader.add(output)
+            writer.add(input)
+            pairs.append((output, input))
+        }
+
         // Video track
         let videoTracks = try await asset.loadTracks(withMediaType: .video)
         if let videoTrack = videoTracks.first {
@@ -90,27 +102,25 @@ struct RealExportSessionFactory: ExportSessionFactory {
             let transform = try await videoTrack.load(.preferredTransform)
             writerInput.transform = transform
 
-            if reader.canAdd(readerOutput) { reader.add(readerOutput) }
-            if writer.canAdd(writerInput) { writer.add(writerInput) }
+            try addPair(readerOutput, writerInput, "video")
         }
 
-        // Audio track (passthrough — nil outputSettings = copy)
+        // Audio track (passthrough — nil outputSettings = copy).
+        // A passthrough input needs the source format hint: without it the writer
+        // refuses some formats, such as camera PCM audio in an .mp4.
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         if let audioTrack = audioTracks.first {
-            let audioReaderOutput = AVAssetReaderTrackOutput(
-                track: audioTrack,
-                outputSettings: nil
-            )
+            let audioReaderOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
             audioReaderOutput.alwaysCopiesSampleData = false
 
             let audioWriterInput = AVAssetWriterInput(
                 mediaType: .audio,
-                outputSettings: nil
+                outputSettings: nil,
+                sourceFormatHint: try await audioTrack.load(.formatDescriptions).first
             )
             audioWriterInput.expectsMediaDataInRealTime = false
 
-            if reader.canAdd(audioReaderOutput) { reader.add(audioReaderOutput) }
-            if writer.canAdd(audioWriterInput) { writer.add(audioWriterInput) }
+            try addPair(audioReaderOutput, audioWriterInput, "audio")
         }
 
         reader.startReading()
@@ -119,9 +129,9 @@ struct RealExportSessionFactory: ExportSessionFactory {
 
         // Process all inputs concurrently
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for i in 0..<writer.inputs.count {
-                let writerInput = writer.inputs[i]
-                let readerOutput = reader.outputs[i]
+            for (i, pair) in pairs.enumerated() {
+                let writerInput = pair.input
+                let readerOutput = pair.output
                 group.addTask {
                     await withCheckedContinuation { continuation in
                         writerInput.requestMediaDataWhenReady(on: DispatchQueue(label: "vcompress.writer.\(i)")) {
@@ -150,4 +160,9 @@ struct RealExportSessionFactory: ExportSessionFactory {
             throw EncodingError.exportFailed(writer.error)
         }
     }
+}
+
+private struct TrackError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }
