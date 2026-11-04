@@ -18,6 +18,10 @@ import CoreMedia
 ///   ffmpeg -f lavfi -i sine=frequency=440:duration=2 \
 ///          -c:a aac \
 ///          Tests/vcompressTests/Integration/Fixtures/audio_only.mov
+///   ffmpeg -f lavfi -i testsrc2=duration=2:size=320x240:rate=30 \
+///          -f lavfi -i sine=frequency=440:duration=2 \
+///          -c:v libx264 -preset ultrafast -c:a pcm_s16be -ac 2 -f mov -brand mp42 \
+///          Tests/vcompressTests/Integration/Fixtures/sample_h264_lpcm.mp4
 final class EncodeIntegrationTests: XCTestCase {
 
     private var tempDir: URL!
@@ -138,5 +142,70 @@ final class EncodeIntegrationTests: XCTestCase {
         let asset = AVURLAsset(url: dest)
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
         XCTAssertFalse(audioTracks.isEmpty, "Output should have audio track")
+    }
+
+    // MARK: - Writer Path (high quality) Audio Tests
+
+    /// AAC audio in a .mov is copied as-is by the writer path.
+    func test_realEncode_highQuality_aacInMov_keepsAudio() async throws {
+        guard fixtureExists("sample_h264.mov") else {
+            throw XCTSkip("Fixture sample_h264.mov not found. Generate with ffmpeg.")
+        }
+
+        let dest = try await encodeFixture("sample_h264.mov", container: "mov", quality: .high)
+
+        let audioCodecs = try await audioCodecs(of: dest)
+        XCTAssertEqual(audioCodecs, [kAudioFormatMPEG4AAC], "AAC audio should be copied as-is")
+    }
+
+    /// Camera files (e.g. Sony XAVC) store big-endian PCM audio in an .mp4.
+    /// The writer path used to drop this audio track with no error.
+    func test_realEncode_highQuality_lpcmInMP4_keepsAudio() async throws {
+        guard fixtureExists("sample_h264_lpcm.mp4") else {
+            throw XCTSkip("Fixture sample_h264_lpcm.mp4 not found. Generate with ffmpeg.")
+        }
+
+        let dest = try await encodeFixture("sample_h264_lpcm.mp4", container: "mp4", quality: .high)
+
+        let audioCodecs = try await audioCodecs(of: dest)
+        XCTAssertEqual(audioCodecs, [kAudioFormatLinearPCM], "PCM audio should be copied as-is, not dropped")
+
+        let audioTracks = try await AVURLAsset(url: dest).loadTracks(withMediaType: .audio)
+        let audioTrack = try XCTUnwrap(audioTracks.first)
+        let audioDuration = try await audioTrack.load(.timeRange).duration.seconds
+        XCTAssertEqual(audioDuration, 2.0, accuracy: 0.1, "Audio should cover the whole clip")
+    }
+
+    private func encodeFixture(_ name: String, container: String, quality: Quality) async throws -> URL {
+        let source = fixtureURL(name)
+        let dest = tempDir.appendingPathComponent("output.\(container)")
+        let inspector = RealAssetInspector()
+        let encoder = Encoder(factory: RealExportSessionFactory(), fs: RealFileSystem(), inspector: inspector)
+
+        let sourceSize = try FileManager.default.attributesOfItem(atPath: source.path)[.size] as? Int64 ?? 0
+        let entry = FileEntry(
+            sourcePath: source.path,
+            relativePath: name,
+            destPath: dest.path,
+            fileSize: sourceSize,
+            sourceContainer: container
+        )
+
+        try await encoder.encode(entry, quality: quality)
+
+        let codecs = try await inspector.videoTrackCodecs(forFileAt: dest)
+        XCTAssertEqual(codecs.first, kCMVideoCodecType_HEVC, "Output should be HEVC")
+        return dest
+    }
+
+    private func audioCodecs(of url: URL) async throws -> [AudioFormatID] {
+        let asset = AVURLAsset(url: url)
+        var result: [AudioFormatID] = []
+        for track in try await asset.loadTracks(withMediaType: .audio) {
+            for desc in try await track.load(.formatDescriptions) {
+                result.append(CMFormatDescriptionGetMediaSubType(desc))
+            }
+        }
+        return result
     }
 }
